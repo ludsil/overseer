@@ -20,14 +20,22 @@ Codex · you@example.com · plus
   Weekly (7d)          66%  resets Thu 09:34
 ```
 
+## Quick start
+
+> [!TIP]
+> **The installer is an agent.** Clone the repo, open Claude Code in it, say the word —
+> it builds the app, installs it, and adds the agent skill:
+>
+> ```sh
+> git clone https://github.com/ludsil/overseer.git && cd overseer
+> claude "set up overseer"
+> ```
+
 ## Install
 
-The fastest path, in the spirit of this repo: **clone it, open Claude Code inside, and
-say "set up overseer"** — it builds the app, installs it, and adds the agent skill. The
-manual equivalent:
+Doing it by hand instead of asking Claude:
 
 ```sh
-git clone https://github.com/ludsil/overseer.git && cd overseer
 brew install librsvg     # icon rendering; Apple Command Line Tools and macOS 13+ required
 ./install.sh             # build the app and install it to ~/Applications
 ./skill/install.sh       # optional: the agent skill, into ~/.claude/skills
