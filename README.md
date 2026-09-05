@@ -22,18 +22,26 @@ Codex · you@example.com · plus
 
 ## Install
 
-Download the latest DMG from the Releases page and drag Overseer into Applications.
-Releases are not notarized, so macOS blocks the first launch: open the app once anyway,
-then go to **System Settings → Privacy & Security**, scroll to the Overseer message, and
-click **Open Anyway** (on macOS 14 and earlier, right-click → Open also works). Overseer
-then lives in the menu bar, with **Launch at Login** in its menu.
-
-Building from source skips the Gatekeeper step entirely:
+The fastest path, in the spirit of this repo: **clone it, open Claude Code inside, and
+say "set up overseer"** — it builds the app, installs it, and adds the agent skill. The
+manual equivalent:
 
 ```sh
-brew install librsvg   # icon rendering; Apple Command Line Tools and macOS 13+ required
-./install.sh           # build and install to ~/Applications
+git clone https://github.com/ludsil/overseer.git && cd overseer
+brew install librsvg     # icon rendering; Apple Command Line Tools and macOS 13+ required
+./install.sh             # build the app and install it to ~/Applications
+./skill/install.sh       # optional: the agent skill, into ~/.claude/skills
 ```
+
+Only want the app? The DMG on the Releases page needs no repo and no build: drag
+Overseer into Applications and open it. Releases are not notarized, so macOS blocks the
+first launch — approve it under **System Settings → Privacy & Security → Open Anyway**
+(on macOS 14 and earlier, right-click → Open also works).
+
+Either way, Overseer lives in the menu bar with **Launch at Login** in its menu, and you
+add subscriptions inside the app: **Manage Claude accounts → Add account** creates the
+profile directory and opens the login for it (logins run through the `claude` CLI you
+already have). No configuration files.
 
 **Updating:** Overseer does not update itself. Download the newest DMG and replace the
 app, or for source installs run `git pull && ./install.sh`.
