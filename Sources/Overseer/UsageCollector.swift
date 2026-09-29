@@ -84,9 +84,10 @@ final class UsageCollector {
         )
         profile.accountKey = account["accountUuid"] as? String
             ?? account["emailAddress"] as? String
+        profile.isImportedPass = ClaudeSession.isImportedPass(directory: directory)
 
         guard let credentials = claudeCredentials(directory: directory) else {
-            profile.error = "not logged in"
+            profile.error = profile.isImportedPass ? "pass expired" : "not logged in"
             return profile
         }
         profile.plan = credentials["subscriptionType"] as? String
@@ -96,7 +97,7 @@ final class UsageCollector {
         // refresh token and can log out a CLI session still holding the previous one.
         // Refreshing is a user action, never a side effect of looking at usage.
         if let expiresAt = number(credentials["expiresAt"]), expiresAt / 1000 < Date().timeIntervalSince1970 {
-            profile.error = "token expired"
+            profile.error = profile.isImportedPass ? "pass expired" : "token expired"
             loadCache(into: &profile)
             return profile
         }

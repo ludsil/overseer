@@ -70,6 +70,25 @@ An expired row shows **Reconnect**, which renews the token silently. **Manage Cl
 accounts** adds, replaces, or removes account directories; a row holding an account
 already shown elsewhere is tagged `duplicate`, since it adds no quota of its own.
 
+## Sharing usage keys
+
+**Manage Claude accounts → Copy usage keys** bundles each account's *short-lived access
+token* — never the rotating refresh token — into a blob you can hand to another machine or
+person. **Import usage keys** installs it from the clipboard. Imported accounts work until
+the token expires (about 8–12h), then re-import; because they carry no refresh token, an
+imported copy can never renew or invalidate the sender's login.
+
+Two forms:
+
+- **Encrypted** — passphrase-protected (AES-GCM); share the passphrase over a separate
+  channel. For Overseer-to-Overseer sharing.
+- **Plain (unsafe)** — no passphrase, for a recipient who doesn't run Overseer. Anyone who
+  gets the blob can use those accounts until the tokens expire, so send it carefully.
+
+Sharing your own subscriptions across your own machines is one thing; handing paid seats
+to other people is generally against the provider's subscription terms. Today this covers
+Claude; Codex and Grok are planned.
+
 ## The agent skill
 
 `skill/` is the other half of the project: a Claude Code skill that teaches agents to

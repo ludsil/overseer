@@ -250,6 +250,87 @@ enum ClaudeSession {
         return linked
     }
 
+    // MARK: - Usage passes (short-lived access-token relay)
+
+    private static let passSentinelName = ".overseer-pass"
+
+    private static func passSentinelPath(_ directory: String) -> String {
+        (directory as NSString).appendingPathComponent(passSentinelName)
+    }
+
+    /// A slot installed from someone else's usage pass: it holds only a short-lived access
+    /// token, has no refresh token, and must never be treated as a normal login (no Reconnect,
+    /// no Make active) - when its token expires the recipient re-imports.
+    static func isImportedPass(directory: String) -> Bool {
+        FileManager.default.fileExists(atPath: passSentinelPath(directory))
+    }
+
+    /// Drop the pass marker when a slot becomes a real login (e.g. Replace with another
+    /// account), so it stops being treated as read-only.
+    static func clearPassMarker(directory: String) {
+        try? FileManager.default.removeItem(atPath: passSentinelPath(directory))
+    }
+
+    private static func expirySeconds(_ oauth: [String: Any]) -> Double? {
+        if let number = oauth["expiresAt"] as? NSNumber { return number.doubleValue / 1000 }
+        if let string = oauth["expiresAt"] as? String, let number = Double(string) { return number / 1000 }
+        return nil
+    }
+
+    /// The shareable fields for a profile, or nil when it can't be shared: not logged in, an
+    /// already-expired access token (nothing useful to relay), or itself an imported pass.
+    /// The rotating refresh token is deliberately never read here.
+    static func claudeShareableEntry(directory: String) -> AccessPass.Entry? {
+        guard !isImportedPass(directory: directory) else { return nil }
+        guard let oauth = credentials(for: directory),
+              let accessToken = oauth["accessToken"] as? String else { return nil }
+        let expiry = expirySeconds(oauth)
+        if let expiry, expiry <= Date().timeIntervalSince1970 { return nil }
+        let account = (readConfig(directory)["oauthAccount"] as? [String: Any]) ?? [:]
+        return AccessPass.Entry(
+            engine: "claude",
+            email: account["emailAddress"] as? String,
+            organization: account["organizationName"] as? String,
+            accountUuid: account["accountUuid"] as? String,
+            plan: oauth["subscriptionType"] as? String,
+            accessToken: accessToken,
+            expiresAt: expiry,
+            scopes: oauth["scopes"] as? [String],
+            subscriptionType: oauth["subscriptionType"] as? String,
+            rateLimitTier: oauth["rateLimitTier"] as? String
+        )
+    }
+
+    /// Installs a usage pass into a slot: an access-token-only Keychain blob (NO refresh
+    /// token, so it can never rotate the sender's login), the account identity, a sentinel
+    /// marking it a pass, and the shared user config so the slot behaves like any other.
+    @discardableResult
+    static func installClaudePass(_ entry: AccessPass.Entry, into directory: String) -> Bool {
+        credentialLock.lock()
+        defer { credentialLock.unlock() }
+        var oauth: [String: Any] = ["accessToken": entry.accessToken]
+        if let expiry = entry.expiresAt { oauth["expiresAt"] = Int(expiry * 1000) }
+        if let scopes = entry.scopes { oauth["scopes"] = scopes }
+        if let subscriptionType = entry.subscriptionType { oauth["subscriptionType"] = subscriptionType }
+        if let rateLimitTier = entry.rateLimitTier { oauth["rateLimitTier"] = rateLimitTier }
+        guard let data = try? JSONSerialization.data(withJSONObject: ["claudeAiOauth": oauth]),
+              let secret = String(data: data, encoding: .utf8),
+              writeSecret(secret, for: directory) else { return false }
+
+        var account: [String: Any] = [:]
+        if let email = entry.email { account["emailAddress"] = email }
+        if let organization = entry.organization { account["organizationName"] = organization }
+        if let uuid = entry.accountUuid { account["accountUuid"] = uuid }
+        var config = readConfig(directory)
+        config["oauthAccount"] = account
+        writeConfig(config, directory: directory)
+
+        FileManager.default.createFile(atPath: passSentinelPath(directory), contents: Data("1".utf8))
+        shareUserConfig(into: directory)
+        Log.account.notice("installed usage pass into \(directory, privacy: .public)")
+        return true
+    }
+
     /// Copies the default profile's login onto a slot before the default is re-authenticated in
     /// the browser, so the outgoing account is parked rather than destroyed by the new login.
     @discardableResult
