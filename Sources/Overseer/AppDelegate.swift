@@ -477,19 +477,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(add)
 
         menu.addItem(.separator())
-        for (title, action, tip) in [
-            ("Copy usage keys (encrypted)…", #selector(copyPassEncrypted),
-             "Copy short-lived access tokens for every account, passphrase-encrypted, to share"),
-            ("Copy usage keys (plain, unsafe)…", #selector(copyPassPlain),
-             "Copy short-lived access tokens with no passphrase — for someone without Overseer"),
-            ("Import usage keys…", #selector(importPass),
-             "Install accounts from a usage-keys blob on the clipboard"),
-        ] {
-            let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
-            item.target = self
-            item.toolTip = tip
-            menu.addItem(item)
-        }
+        // The choice that matters is who the keys are for, not the crypto: encrypted blobs can
+        // only be opened by another Overseer; plain text works anywhere but protects nothing.
+        let copyMenu = NSMenu()
+        let encryptedItem = NSMenuItem(
+            title: "For another Overseer (encrypted)…",
+            action: #selector(copyPassEncrypted), keyEquivalent: ""
+        )
+        encryptedItem.target = self
+        encryptedItem.toolTip = "Passphrase-protected. Only Overseer can import these — the "
+            + "recipient pastes the blob and enters the passphrase you give them separately."
+        copyMenu.addItem(encryptedItem)
+        let plainItem = NSMenuItem(
+            title: "As plain text (works anywhere — unsafe)…",
+            action: #selector(copyPassPlain), keyEquivalent: ""
+        )
+        plainItem.target = self
+        plainItem.toolTip = "No Overseer needed — the tokens are readable as-is. Anyone who "
+            + "gets the blob can use the accounts until the tokens expire."
+        copyMenu.addItem(plainItem)
+        let copyRoot = NSMenuItem(title: "Copy usage keys", action: nil, keyEquivalent: "")
+        copyRoot.toolTip = "Copy every account's short-lived access token to share — "
+            + "the login itself never leaves this Mac, and shared keys expire in hours"
+        copyRoot.submenu = copyMenu
+        menu.addItem(copyRoot)
+
+        let importItem = NSMenuItem(
+            title: "Import usage keys…", action: #selector(importPass), keyEquivalent: ""
+        )
+        importItem.target = self
+        importItem.toolTip = "Install accounts from a usage-keys blob on the clipboard"
+        menu.addItem(importItem)
 
         for profile in profiles where profile.engine == .claude {
             menu.addItem(.separator())
@@ -620,12 +638,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         showInfo(
             "Usage keys copied",
             encrypted
-                ? "Copied \(count) account(s) to the clipboard, encrypted with passphrase:\n\n"
-                    + "\(passphrase ?? "")\n\nShare that passphrase over a separate channel. The "
-                    + "keys work until each token expires (about 8–12h)."
-                : "Copied \(count) account(s) to the clipboard in PLAIN text — anyone who gets "
-                    + "this blob can use those accounts until the tokens expire (about 8–12h). "
-                    + "Send it carefully."
+                ? "Copied \(count) account(s), encrypted with passphrase:\n\n\(passphrase ?? "")\n\n"
+                    + "The recipient needs Overseer to import them (Manage Claude accounts → "
+                    + "Import usage keys) and the passphrase — share it over a separate channel. "
+                    + "The keys work until each token expires (about 8–12h)."
+                : "Copied \(count) account(s) in PLAIN text — no Overseer needed to read them, "
+                    + "which also means anyone who gets this blob can use those accounts until "
+                    + "the tokens expire (about 8–12h). Send it carefully."
         )
     }
 

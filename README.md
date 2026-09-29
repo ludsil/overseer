@@ -78,12 +78,13 @@ person. **Import usage keys** installs it from the clipboard. Imported accounts 
 the token expires (about 8–12h), then re-import; because they carry no refresh token, an
 imported copy can never renew or invalidate the sender's login.
 
-Two forms:
+Two forms, chosen by who receives them:
 
-- **Encrypted** — passphrase-protected (AES-GCM); share the passphrase over a separate
-  channel. For Overseer-to-Overseer sharing.
-- **Plain (unsafe)** — no passphrase, for a recipient who doesn't run Overseer. Anyone who
-  gets the blob can use those accounts until the tokens expire, so send it carefully.
+- **For another Overseer (encrypted)** — passphrase-protected; only Overseer's Import can
+  open it, and you share the passphrase over a separate channel. The default choice.
+- **As plain text (unsafe)** — readable by anything, for a recipient who doesn't run
+  Overseer. Anyone who gets the blob can use those accounts until the tokens expire, so
+  send it carefully.
 
 Sharing your own subscriptions across your own machines is one thing; handing paid seats
 to other people is generally against the provider's subscription terms. Today this covers
