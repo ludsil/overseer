@@ -276,16 +276,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func isAuthError(_ error: String) -> Bool {
-        ["token expired", "token stale", "not logged in", "missing access token"].contains(error)
+        ["token expired", "token stale", "not logged in", "missing access token", "pass expired"]
+            .contains(error)
     }
 
     /// A short label for an auth problem shown beside the account.
     private func authLabel(_ error: String) -> String {
         switch error {
         case "token expired", "token stale": return "expired"
+        case "pass expired": return "pass expired"
         case "not logged in", "missing access token": return "not signed in"
         default: return error
         }
+    }
+
+    /// A shared pass has no refresh token, so it can't renew in place — the recipient pastes
+    /// a fresh blob and re-imports.
+    private func reimportControl() -> NSView {
+        let button = NSButton(title: "Re-import", target: self, action: #selector(importPass))
+        button.bezelStyle = .rounded
+        button.controlSize = .small
+        button.font = .systemFont(ofSize: 11, weight: .medium)
+        button.toolTip = "This shared pass expired. Copy a fresh usage-keys blob and re-import."
+        return button
     }
 
     /// Maps a raw fetch error to what the user should read. A transient upstream failure over
@@ -414,7 +427,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.signingIn.remove(directory)
                 switch result {
                 case .success:
-                    break
+                    ClaudeSession.clearPassMarker(directory: directory)
                 case .wrongAccount(let requested, let actual):
                     self.loginNotice = "Browser signed in as \(actual), not \(requested). "
                         + "Your browser's live claude.ai session decided - retry from a private "
@@ -462,6 +475,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         add.target = self
         add.toolTip = "Opens the Claude login and adds that account to this list"
         menu.addItem(add)
+
+        menu.addItem(.separator())
+        // The choice that matters is who the keys are for, not the crypto: encrypted blobs can
+        // only be opened by another Overseer; plain text works anywhere but protects nothing.
+        let copyMenu = NSMenu()
+        let encryptedItem = NSMenuItem(
+            title: "For another Overseer (encrypted)…",
+            action: #selector(copyPassEncrypted), keyEquivalent: ""
+        )
+        encryptedItem.target = self
+        encryptedItem.toolTip = "Passphrase-protected. Only Overseer can import these — the "
+            + "recipient pastes the blob and enters the passphrase you give them separately."
+        copyMenu.addItem(encryptedItem)
+        let plainItem = NSMenuItem(
+            title: "As plain text (works anywhere — unsafe)…",
+            action: #selector(copyPassPlain), keyEquivalent: ""
+        )
+        plainItem.target = self
+        plainItem.toolTip = "No Overseer needed — the tokens are readable as-is. Anyone who "
+            + "gets the blob can use the accounts until the tokens expire."
+        copyMenu.addItem(plainItem)
+        let copyRoot = NSMenuItem(title: "Copy usage keys", action: nil, keyEquivalent: "")
+        copyRoot.toolTip = "Copy every account's short-lived access token to share — "
+            + "the login itself never leaves this Mac, and shared keys expire in hours"
+        copyRoot.submenu = copyMenu
+        menu.addItem(copyRoot)
+
+        let importItem = NSMenuItem(
+            title: "Import usage keys…", action: #selector(importPass), keyEquivalent: ""
+        )
+        importItem.target = self
+        importItem.toolTip = "Install accounts from a usage-keys blob on the clipboard"
+        menu.addItem(importItem)
 
         for profile in profiles where profile.engine == .claude {
             menu.addItem(.separator())
@@ -521,6 +567,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// created behind the scenes and never shown - the account's own name is the identity.
     @objc private func addAccount() {
         popover.performClose(nil)
+        let directory = nextSlotDirectory()
+        ClaudeSession.shareUserConfig(into: directory)
+        beginLogin(directory: directory, email: nil)
+    }
+
+    /// The next free `~/.claude-N` slot directory, created on disk. Shared by Add account and
+    /// by importing a usage pass.
+    private func nextSlotDirectory() -> String {
         let home = NSHomeDirectory()
         var index = 2
         var directory = "\(home)/.claude-\(index)"
@@ -531,8 +585,192 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         try? FileManager.default.createDirectory(
             atPath: directory, withIntermediateDirectories: true
         )
-        ClaudeSession.shareUserConfig(into: directory)
-        beginLogin(directory: directory, email: nil)
+        return directory
+    }
+
+    // MARK: - Usage passes
+
+    @objc private func copyPassEncrypted() { exportPass(encrypted: true) }
+    @objc private func copyPassPlain() { exportPass(encrypted: false) }
+
+    private func exportPass(encrypted: Bool) {
+        popover.performClose(nil)
+        let entries = profiles.compactMap { profile -> AccessPass.Entry? in
+            guard profile.engine == .claude, profile.sameAccountAs == nil else { return nil }
+            return ClaudeSession.claudeShareableEntry(directory: profile.directory)
+        }
+        guard !entries.isEmpty else {
+            showInfo("Nothing to share", "No Claude account has a live token to export right now. "
+                + "Reconnect one and try again.")
+            return
+        }
+
+        var passphrase: String?
+        if encrypted {
+            // A generated passphrase is the real defense: a user-typed one is usually far too
+            // weak to survive the token's own lifetime against offline guessing. Pre-fill a
+            // strong one they copy; allow their own only past a minimum length.
+            guard let entered = promptPassphrase(
+                title: "Encrypt usage keys",
+                info: "A strong passphrase is filled in — copy it and give it to the recipient "
+                    + "over a different channel than the keys. Or type your own (10+ characters).",
+                suggestion: generatePassphrase(),
+                minLength: 10
+            ), !entered.isEmpty else { return }
+            passphrase = entered
+        }
+
+        let package = AccessPass.makePackage(entries, createdAt: Date().timeIntervalSince1970)
+        let blob: String
+        do {
+            blob = try passphrase.map { try AccessPass.encodeEncrypted(package, passphrase: $0) }
+                ?? AccessPass.encodePlain(package)
+        } catch {
+            showInfo("Couldn’t create the keys", (error as? AccessPass.PassError)?.description
+                ?? "The keys couldn’t be encoded.")
+            return
+        }
+
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(blob, forType: .string)
+        let count = entries.count
+        showInfo(
+            "Usage keys copied",
+            encrypted
+                ? "Copied \(count) account(s), encrypted with passphrase:\n\n\(passphrase ?? "")\n\n"
+                    + "The recipient needs Overseer to import them (Manage Claude accounts → "
+                    + "Import usage keys) and the passphrase — share it over a separate channel. "
+                    + "The keys work until each token expires (about 8–12h)."
+                : "Copied \(count) account(s) in PLAIN text — no Overseer needed to read them, "
+                    + "which also means anyone who gets this blob can use those accounts until "
+                    + "the tokens expire (about 8–12h). Send it carefully."
+        )
+    }
+
+    /// ~14 Crockford-base32 chars ≈ 72 bits — strong enough to outlast the token even against
+    /// offline guessing, and it never needs to be memorable since it travels out-of-band.
+    private func generatePassphrase() -> String {
+        let alphabet = Array("0123456789ABCDEFGHJKMNPQRSTVWXYZ")
+        return String((0 ..< 14).map { _ in alphabet.randomElement()! })
+    }
+
+    @objc private func importPass() {
+        popover.performClose(nil)
+        guard let blob = NSPasteboard.general.string(forType: .string),
+              !blob.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            showInfo("Nothing to import", "Copy a usage-keys blob to the clipboard first, then "
+                + "choose Import usage keys.")
+            return
+        }
+
+        var passphrase: String?
+        if AccessPass.isEncrypted(blob) {
+            guard let entered = promptPassphrase(
+                title: "Import usage keys",
+                info: "Enter the passphrase the sender gave you."
+            ) else { return }
+            passphrase = entered
+        }
+
+        let package: AccessPass.Package
+        do {
+            package = try AccessPass.decode(blob, passphrase: passphrase)
+        } catch {
+            showInfo("Couldn’t import", (error as? AccessPass.PassError)?.description
+                ?? "Those usage keys couldn’t be read.")
+            return
+        }
+
+        // Only Claude is supported today, and an already-expired token installs a dead slot.
+        let now = Date().timeIntervalSince1970
+        let claude = package.passes.filter { $0.engine == "claude" }
+        let installable = claude.filter { ($0.expiresAt ?? .greatestFiniteMagnitude) > now }
+        let expired = claude.count - installable.count
+        let otherEngines = package.passes.count - claude.count
+        guard !installable.isEmpty else {
+            showInfo("Nothing to import", "These keys are all expired, or for engines this "
+                + "version doesn’t support yet (Claude only).")
+            return
+        }
+
+        // Confirm before installing — on the plain path nothing authenticates the contents.
+        let names = installable.map { $0.email ?? "an account" }.joined(separator: ", ")
+        let unauthenticatedWarning = passphrase == nil
+            ? "\n\nThese keys were not encrypted — anyone could have altered them in transit."
+            : ""
+        guard confirm(
+            "Import \(installable.count) account(s)?",
+            "\(names)\(unauthenticatedWarning)"
+        ) else { return }
+
+        var installed = 0
+        var failed: [String] = []
+        for entry in installable {
+            let directory = nextSlotDirectory()
+            if ClaudeSession.installClaudePass(entry, into: directory) {
+                installed += 1
+            } else {
+                failed.append(entry.email ?? "an account")
+                try? FileManager.default.removeItem(atPath: directory)
+            }
+        }
+
+        var message = "Imported \(installed) account(s). They work until each token expires, "
+            + "then re-import."
+        var notes: [String] = []
+        if expired > 0 { notes.append("\(expired) expired") }
+        if otherEngines > 0 { notes.append("\(otherEngines) for unsupported engines") }
+        if !failed.isEmpty { notes.append("\(failed.count) failed to install") }
+        if !notes.isEmpty { message += "\nSkipped: \(notes.joined(separator: ", "))." }
+        showInfo("Usage keys imported", message)
+        refresh()
+    }
+
+    private func confirm(_ title: String, _ text: String) -> Bool {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = text
+        alert.addButton(withTitle: "Import")
+        alert.addButton(withTitle: "Cancel")
+        alert.alertStyle = .warning
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    private func promptPassphrase(
+        title: String,
+        info: String,
+        suggestion: String? = nil,
+        minLength: Int = 0
+    ) -> String? {
+        NSApp.activate(ignoringOtherApps: true)
+        // A visible field, not a secure one: the passphrase is meant to be read off and shared
+        // out-of-band, and a generated suggestion is useless if it's masked to dots.
+        while true {
+            let alert = NSAlert()
+            alert.messageText = title
+            alert.informativeText = info
+            let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+            if let suggestion { field.stringValue = suggestion }
+            alert.accessoryView = field
+            alert.addButton(withTitle: "OK")
+            alert.addButton(withTitle: "Cancel")
+            alert.window.initialFirstResponder = field
+            guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+            if field.stringValue.count >= minLength { return field.stringValue }
+            showInfo("Passphrase too short", "Use at least \(minLength) characters, or keep the "
+                + "suggested one.")
+        }
+    }
+
+    private func showInfo(_ title: String, _ text: String) {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = text
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
     }
 
     @objc private func reconnect(_ sender: NSButton) {
@@ -620,6 +858,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             row.addArrangedSubview(label)
         }
 
+        if profile.isImportedPass {
+            row.addArrangedSubview(textLabel(
+                "·",
+                font: .systemFont(ofSize: 11, weight: .regular),
+                color: UsageFormatting.tertiaryText
+            ))
+            let label = textLabel(
+                "shared pass",
+                font: .systemFont(ofSize: 11.5, weight: .regular),
+                color: UsageFormatting.tertiaryText
+            )
+            label.toolTip = "Imported from someone else's usage keys — a short-lived token with "
+                + "no ability to renew. It works until the token expires, then re-import."
+            row.addArrangedSubview(label)
+        }
+
         if let error = profile.error, isAuthError(error) {
             row.addArrangedSubview(textLabel(
                 "·",
@@ -653,7 +907,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
         row.addArrangedSubview(spacer)
 
-        if profile.engine == .claude, let error = profile.error, isAuthError(error) {
+        if profile.engine == .claude, profile.isImportedPass {
+            // Passes never renew in place and can't be made active — on expiry, re-import.
+            if let plan = profile.plan, !plan.isEmpty {
+                row.addArrangedSubview(textLabel(
+                    plan.uppercased(),
+                    font: .systemFont(ofSize: 9.5, weight: .semibold),
+                    color: UsageFormatting.secondaryText
+                ))
+            }
+            if let error = profile.error, isAuthError(error) {
+                row.addArrangedSubview(reimportControl())
+            }
+        } else if profile.engine == .claude, let error = profile.error, isAuthError(error) {
             row.addArrangedSubview(reconnectControl(for: profile))
         } else {
             if let plan = profile.plan, !plan.isEmpty {

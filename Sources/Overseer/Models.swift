@@ -38,6 +38,9 @@ struct UsageProfile: Codable {
     /// The email/organization was confirmed against the token this cycle (via the profile
     /// endpoint), not merely read from `.claude.json`, which only records who logged in last.
     var identityVerified: Bool = false
+    /// Installed from someone else's usage pass: a short-lived access token with no refresh
+    /// token. Shown read-only - it offers Re-import on expiry, not Reconnect or Make active.
+    var isImportedPass: Bool = false
 
     private enum CodingKeys: String, CodingKey {
         case engine, directory, name, email, organization, plan, limits, error, note
