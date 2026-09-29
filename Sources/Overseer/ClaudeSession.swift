@@ -10,6 +10,12 @@ import Foundation
 /// common case is a silent one-word run, and only a genuinely logged-out profile needs the
 /// interactive login.
 enum ClaudeSession {
+    /// Every credential mutation (swap, park, refresh, remove) is serialized through this
+    /// lock. Two writers rotating one refresh token invalidate each other, so the app must
+    /// never run two of these operations at once - reconnect, make-active, and remove can
+    /// otherwise fire concurrently off different dispatch queues.
+    private static let credentialLock = NSLock()
+
     /// The default profile must be driven with CLAUDE_CONFIG_DIR *unset*. Setting it - even to
     /// the default path itself - moves the CLI onto a hash-suffixed Keychain item and an
     /// in-directory config file, forking the profile's identity from what every plain
@@ -116,7 +122,11 @@ enum ClaudeSession {
         process.standardError = Pipe()
         guard (try? process.run()) != nil else { return false }
         process.waitUntilExit()
-        return process.terminationStatus == 0
+        let ok = process.terminationStatus == 0
+        Log.credential.notice(
+            "writeSecret \(keychainService(for: directory), privacy: .public): \(ok ? "ok" : "failed", privacy: .public)"
+        )
+        return ok
     }
 
     private static func deleteSecret(for directory: String) {
@@ -182,6 +192,8 @@ enum ClaudeSession {
     /// with nothing changed when the slot holds no login or the first Keychain write fails.
     static func swapWithDefault(directory: String) -> Bool {
         guard !isDefault(directory) else { return false }
+        credentialLock.lock()
+        defer { credentialLock.unlock() }
         guard let slotSecret = rawSecret(for: directory) else { return false }
         let outgoingSecret = rawSecret(for: defaultDirectory)
 
@@ -194,7 +206,16 @@ enum ClaudeSession {
         } else {
             deleteSecret(for: directory)
         }
+        // Confirm the credential actually landed on the default profile before the UI is
+        // told the swap succeeded - a silent write failure otherwise reads as a working
+        // switch that quietly did nothing.
+        guard rawSecret(for: defaultDirectory) == slotSecret else {
+            Log.account.fault("swap read-back mismatch on default profile; rolling back")
+            if let outgoingSecret { writeSecret(outgoingSecret, for: defaultDirectory) }
+            return false
+        }
         swapIdentity(defaultDirectory, directory)
+        Log.account.notice("swapped account onto default profile from \(directory, privacy: .public)")
         return true
     }
 
@@ -233,11 +254,17 @@ enum ClaudeSession {
     /// the browser, so the outgoing account is parked rather than destroyed by the new login.
     @discardableResult
     static func parkDefault(on directory: String) -> Bool {
-        guard !isDefault(directory), let secret = rawSecret(for: defaultDirectory) else {
-            return false
-        }
+        guard !isDefault(directory) else { return false }
+        credentialLock.lock()
+        defer { credentialLock.unlock() }
+        guard let secret = rawSecret(for: defaultDirectory) else { return false }
         guard writeSecret(secret, for: directory) else { return false }
         copyIdentity(from: defaultDirectory, to: directory)
+        // Move, not copy: remove the default's item so one refresh token is never live in two
+        // Keychain slots (the follow-up browser login mints a fresh one for the default). A
+        // duplicate would otherwise let the two rotate each other dead.
+        deleteSecret(for: defaultDirectory)
+        Log.account.notice("parked default login onto \(directory, privacy: .public) before re-login")
         return true
     }
 
@@ -301,6 +328,8 @@ enum ClaudeSession {
     /// other ("token disconnected"). An expired worker token is itself proof no live session
     /// owns the profile; the default profile always risks an idle session holding the token.
     static func refreshOAuth(directory: String) -> Bool {
+        credentialLock.lock()
+        defer { credentialLock.unlock() }
         guard let raw = rawSecret(for: directory),
               var root = try? JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any],
               var oauth = root["claudeAiOauth"] as? [String: Any],
@@ -318,15 +347,42 @@ enum ClaudeSession {
 
         let semaphore = DispatchSemaphore(value: 0)
         var payload: [String: Any]?
-        URLSession.shared.dataTask(with: request) { data, response, _ in
+        var failure: String?
+        URLSession.shared.dataTask(with: request) { data, response, error in
             defer { semaphore.signal() }
-            guard let http = response as? HTTPURLResponse,
-                  (200..<300).contains(http.statusCode), let data else { return }
-            payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            if let error { failure = error.localizedDescription; return }
+            guard let http = response as? HTTPURLResponse, let data else {
+                failure = "no response"
+                return
+            }
+            let body = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            if (200..<300).contains(http.statusCode) {
+                payload = body
+            } else {
+                // The body names the real cause - invalid_grant means the refresh token was
+                // already spent (a same-day logout), not a transient network fault.
+                failure = (body?["error_description"] as? String)
+                    ?? (body?["error"] as? String) ?? "HTTP \(http.statusCode)"
+            }
         }.resume()
         _ = semaphore.wait(timeout: .now() + 20)
 
         guard let payload, let accessToken = payload["access_token"] as? String else {
+            Log.credential.fault(
+                "OAuth refresh failed for \(directory, privacy: .public): \(failure ?? "no token in response", privacy: .public)"
+            )
+            return false
+        }
+        // Compare-and-swap: if another writer rotated the stored refresh token while our
+        // request was in flight, theirs is newer - writing ours would spend a token they
+        // still hold and log that account out. Abort and let their credential stand.
+        guard let currentRaw = rawSecret(for: directory),
+              let currentRoot = try? JSONSerialization.jsonObject(with: Data(currentRaw.utf8)) as? [String: Any],
+              let currentOauth = currentRoot["claudeAiOauth"] as? [String: Any],
+              currentOauth["refreshToken"] as? String == refreshToken else {
+            Log.credential.fault(
+                "refresh token rotated under us for \(directory, privacy: .public); discarding our refresh"
+            )
             return false
         }
         oauth["accessToken"] = accessToken
@@ -347,6 +403,8 @@ enum ClaudeSession {
     @discardableResult
     static func removeProfile(directory: String) -> Bool {
         guard !isDefault(directory) else { return false }
+        credentialLock.lock()
+        defer { credentialLock.unlock() }
         let delete = Process()
         delete.executableURL = URL(fileURLWithPath: "/usr/bin/security")
         delete.arguments = ["delete-generic-password", "-s", keychainService(for: directory)]

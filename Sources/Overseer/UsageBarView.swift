@@ -4,9 +4,9 @@ final class UsageBarView: NSView {
     private let fraction: CGFloat
     private let fillColor: NSColor
 
-    init(percent: Double?, color: NSColor) {
+    init(percent: Double?, color: NSColor, dimmed: Bool = false) {
         fraction = CGFloat(min(100, max(0, percent ?? 0)) / 100)
-        fillColor = color
+        fillColor = dimmed ? color.withAlphaComponent(0.32) : color
         super.init(frame: .zero)
         setAccessibilityElement(true)
         setAccessibilityRole(.progressIndicator)

@@ -32,6 +32,17 @@ struct UsageProfile: Codable {
     var accountKey: String?
     /// Set when an earlier slot already holds this account: this slot has no quota of its own.
     var sameAccountAs: String?
+    /// The limits shown are replayed from cache because this cycle's fetch failed - the
+    /// numbers are as old as `observedAt`, not live.
+    var isStale: Bool = false
+    /// The email/organization was confirmed against the token this cycle (via the profile
+    /// endpoint), not merely read from `.claude.json`, which only records who logged in last.
+    var identityVerified: Bool = false
+
+    private enum CodingKeys: String, CodingKey {
+        case engine, directory, name, email, organization, plan, limits, error, note
+        case observedAt, accountKey, sameAccountAs
+    }
 }
 
 struct CachedLimits: Codable {

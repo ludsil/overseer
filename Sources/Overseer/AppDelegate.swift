@@ -21,6 +21,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     )
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // A second instance means a second 5-minute timer and a second set of credential
+        // writers racing the first. Defer to the copy already running.
+        let bundleID = Bundle.main.bundleIdentifier ?? "com.ludsil.overseer"
+        if NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).count > 1 {
+            NSApp.terminate(nil)
+            return
+        }
         NSApp.setActivationPolicy(.accessory)
         NSApp.appearance = NSAppearance(named: .darkAqua)
         configureStatusItem()
@@ -223,10 +230,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Auth problems ride along in the header next to the account they belong to; anything
         // else still gets its own line.
         if let error = profile.error, !isAuthError(error) {
+            let issue = displayIssue(error, hasCache: !profile.limits.isEmpty)
             let errorLabel = textLabel(
-                error,
+                issue.text,
                 font: .systemFont(ofSize: 11.5, weight: .medium),
-                color: UsageFormatting.color(for: "critical")
+                color: UsageFormatting.color(for: issue.severity)
             )
             addFullWidth(errorLabel, to: stack, height: 14)
         }
@@ -238,7 +246,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let inheritedSeverity = weeklyExhausted && limit.label == "Session (5h)"
                 ? "critical"
                 : nil
-            let row = usageRow(limit, severityOverride: inheritedSeverity)
+            let row = usageRow(limit, severityOverride: inheritedSeverity, dimmed: profile.isStale)
             addFullWidth(row.view, to: stack, height: row.height)
         }
 
@@ -268,7 +276,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func isAuthError(_ error: String) -> Bool {
-        ["token expired", "not logged in", "missing access token"].contains(error)
+        ["token expired", "token stale", "not logged in", "missing access token"].contains(error)
+    }
+
+    /// A short label for an auth problem shown beside the account.
+    private func authLabel(_ error: String) -> String {
+        switch error {
+        case "token expired", "token stale": return "expired"
+        case "not logged in", "missing access token": return "not signed in"
+        default: return error
+        }
+    }
+
+    /// Maps a raw fetch error to what the user should read. A transient upstream failure over
+    /// cached numbers is a calm "showing last known", not an alarming red "HTTP 503".
+    private func displayIssue(_ error: String, hasCache: Bool) -> (text: String, severity: String) {
+        let transient = error.hasPrefix("HTTP 5") || error.hasPrefix("HTTP 429")
+            || error == "network timeout" || error == "no response" || error == "invalid usage response"
+        if transient {
+            return hasCache
+                ? ("Couldn’t refresh — showing last known", "warning")
+                : ("Temporarily unavailable — will retry", "warning")
+        }
+        return (error, "critical")
     }
 
     /// One click back to a working profile: renew silently when a credential is still stored,
@@ -359,6 +389,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.switching.remove(directory)
                 if swapped {
                     self.applySwapLocally(directory: directory)
+                    // The app can't see or stop a Claude session still running on the previous
+                    // account, and such a session rewrites its own login back on refresh -
+                    // reverting the switch. Say so, since it's the one race we can't close.
+                    self.loginNotice = "Switched. Quit any Claude session still running on the "
+                        + "previous account so it doesn't revert the switch."
                 } else {
                     self.loginNotice = "Could not swap accounts - the Keychain move failed "
                         + "and nothing was changed."
@@ -592,10 +627,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 color: UsageFormatting.tertiaryText
             ))
             row.addArrangedSubview(textLabel(
-                error,
+                authLabel(error),
                 font: .systemFont(ofSize: 11.5, weight: .regular),
                 color: UsageFormatting.color(for: "critical")
             ))
+        } else if profile.engine == .claude, profile.sameAccountAs == nil, !profile.identityVerified {
+            // Live numbers but the account behind them wasn't confirmed against the token this
+            // cycle (the profile endpoint didn't answer): name it as last-known, not certain.
+            row.addArrangedSubview(textLabel(
+                "·",
+                font: .systemFont(ofSize: 11, weight: .regular),
+                color: UsageFormatting.tertiaryText
+            ))
+            let chip = textLabel(
+                "unverified",
+                font: .systemFont(ofSize: 11.5, weight: .regular),
+                color: UsageFormatting.tertiaryText
+            )
+            chip.toolTip = "Showing the last signed-in identity for this profile - Overseer "
+                + "couldn't confirm it against the live token this cycle."
+            row.addArrangedSubview(chip)
         }
 
         let spacer = NSView()
@@ -638,15 +689,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func usageRow(
         _ limit: UsageLimit,
-        severityOverride: String? = nil
+        severityOverride: String? = nil,
+        dimmed: Bool = false
     ) -> (view: NSView, height: CGFloat) {
         let row = NSView()
-        let color = UsageFormatting.color(for: severityOverride ?? limit.severity)
+        let baseColor = UsageFormatting.color(for: severityOverride ?? limit.severity)
+        let color = dimmed ? baseColor.withAlphaComponent(0.5) : baseColor
 
         let title = textLabel(
             limit.label,
             font: .systemFont(ofSize: 11.5, weight: .medium),
-            color: UsageFormatting.primaryText
+            color: dimmed ? UsageFormatting.secondaryText : UsageFormatting.primaryText
         )
         title.toolTip = limit.label
         let percentage = limit.percent.map { String(format: "%.0f%%", $0) } ?? "—"
@@ -662,7 +715,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             color: UsageFormatting.secondaryText
         )
         resetLabel.alignment = .right
-        let bar = UsageBarView(percent: limit.percent, color: color)
+        let bar = UsageBarView(percent: limit.percent, color: baseColor, dimmed: dimmed)
 
         for view in [title, percentageLabel, resetLabel, bar] {
             view.translatesAutoresizingMaskIntoConstraints = false

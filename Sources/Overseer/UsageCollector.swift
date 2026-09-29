@@ -85,55 +85,41 @@ final class UsageCollector {
         profile.accountKey = account["accountUuid"] as? String
             ?? account["emailAddress"] as? String
 
-        guard var credentials = claudeCredentials(directory: directory) else {
+        guard let credentials = claudeCredentials(directory: directory) else {
             profile.error = "not logged in"
             return profile
         }
         profile.plan = credentials["subscriptionType"] as? String
 
+        // The collector only READS. An expired token is surfaced (so the row offers
+        // Reconnect) rather than refreshed here: an unattended refresh rotates the shared
+        // refresh token and can log out a CLI session still holding the previous one.
+        // Refreshing is a user action, never a side effect of looking at usage.
         if let expiresAt = number(credentials["expiresAt"]), expiresAt / 1000 < Date().timeIntervalSince1970 {
-            // Expiry is renewed in place rather than reported: see refreshOAuth for why an
-            // expired non-default token is the one case where that is race-free.
-            if !ClaudeSession.isDefault(directory),
-               ClaudeSession.refreshOAuth(directory: directory),
-               let renewed = claudeCredentials(directory: directory) {
-                credentials = renewed
-            } else {
-                profile.error = "token expired"
-                loadCache(into: &profile)
-                return profile
-            }
+            profile.error = "token expired"
+            loadCache(into: &profile)
+            return profile
         }
-        guard var accessToken = credentials["accessToken"] as? String else {
+        guard let accessToken = credentials["accessToken"] as? String else {
             profile.error = "missing access token"
             return profile
         }
 
-        // The expiry timestamp sometimes claims validity the server no longer honors, so a
-        // stale-token rejection gets one renew-and-retry before it is surfaced.
-        var attempt = fetchUsage(token: accessToken)
-        if case .failure(let error) = attempt, error.description == "token stale",
-           !ClaudeSession.isDefault(directory),
-           ClaudeSession.refreshOAuth(directory: directory),
-           let renewed = claudeCredentials(directory: directory),
-           let renewedToken = renewed["accessToken"] as? String {
-            accessToken = renewedToken
-            attempt = fetchUsage(token: accessToken)
-        }
-
-        // The TOKEN decides who this profile is. `.claude.json` only records who logged in
-        // last, and any running session rewrites it on refresh - so after an account swap a
-        // live session can stamp its own account back onto the default profile's config and
-        // the row would name the wrong subscription while showing the right numbers. Observed
-        // 2026-08-22. Config stays the offline fallback.
-        if let identity = claudeIdentity(token: accessToken) {
-            profile.email = identity.email ?? profile.email
-            profile.organization = identity.organization ?? profile.organization
-            profile.accountKey = identity.uuid ?? identity.email ?? profile.accountKey
-        }
+        let attempt = fetchUsage(token: accessToken)
 
         switch attempt {
         case .success(let payload):
+            // The TOKEN decides who this profile is. `.claude.json` only records who logged
+            // in last, and a running session rewrites it on refresh - so after a swap a live
+            // session can stamp its own account back onto the default profile's config and
+            // the row would name the wrong subscription. Config is the offline fallback;
+            // identityVerified marks a row confirmed against the live token.
+            if let identity = claudeIdentity(token: accessToken) {
+                profile.email = identity.email ?? profile.email
+                profile.organization = identity.organization ?? profile.organization
+                profile.accountKey = identity.uuid ?? identity.email ?? profile.accountKey
+                profile.identityVerified = true
+            }
             guard let object = try? JSONSerialization.jsonObject(with: payload) as? [String: Any],
                   let limits = object["limits"] as? [[String: Any]] else {
                 profile.error = "invalid usage response"
@@ -145,6 +131,7 @@ final class UsageCollector {
         case .failure(let error):
             profile.error = error.description
             loadCache(into: &profile)
+            Log.fetch.error("usage fetch failed (\(error.description, privacy: .public)); showing cache")
         }
         return profile
     }
@@ -512,25 +499,71 @@ final class UsageCollector {
         return nil
     }
 
+    private enum Outcome {
+        case success(Data)
+        /// Transient - worth another attempt after `retryAfter` (or a computed backoff).
+        case retryable(String, retryAfter: TimeInterval?)
+        /// Terminal - retrying cannot help (auth, 4xx, empty body).
+        case fatal(String)
+    }
+
+    /// The usage endpoint is undocumented and Cloudflare-fronted; it returns the occasional
+    /// transient 5xx that a second attempt clears. 429/5xx and transport errors retry with
+    /// backoff (honoring Retry-After); 401 and other 4xx are terminal so a stale token still
+    /// surfaces immediately for the Reconnect button.
     private func synchronousRequest(_ request: URLRequest) -> Result<Data, RequestError> {
+        let maxAttempts = 3
+        var lastMessage = "network timeout"
+        for attempt in 1...maxAttempts {
+            switch performRequest(request) {
+            case .success(let data):
+                return .success(data)
+            case .fatal(let message):
+                return .failure(.message(message))
+            case .retryable(let message, let retryAfter):
+                lastMessage = message
+                if attempt == maxAttempts { break }
+                let backoff = retryAfter ?? (pow(2.0, Double(attempt - 1)) + Double.random(in: 0...0.5))
+                Log.fetch.debug(
+                    "\(message, privacy: .public) on \(request.url?.path ?? "?", privacy: .public), attempt \(attempt)/\(maxAttempts), retrying in \(backoff, format: .fixed(precision: 1))s"
+                )
+                Thread.sleep(forTimeInterval: min(backoff, 8))
+            }
+        }
+        return .failure(.message(lastMessage))
+    }
+
+    private func performRequest(_ request: URLRequest) -> Outcome {
         let semaphore = DispatchSemaphore(value: 0)
-        var result: Result<Data, RequestError> = .failure(.message("network timeout"))
+        var outcome: Outcome = .retryable("network timeout", retryAfter: nil)
         let task = URLSession.shared.dataTask(with: request) { data, response, error in
             defer { semaphore.signal() }
             if let error {
-                result = .failure(.message(error.localizedDescription))
+                outcome = .retryable(error.localizedDescription, retryAfter: nil)
                 return
             }
-            if let response = response as? HTTPURLResponse, !(200..<300).contains(response.statusCode) {
-                let message = response.statusCode == 401 ? "token stale" : "HTTP \(response.statusCode)"
-                result = .failure(.message(message))
+            guard let http = response as? HTTPURLResponse else {
+                outcome = .fatal("no response")
                 return
             }
-            result = data.map(Result.success) ?? .failure(.message("empty response"))
+            let code = http.statusCode
+            if (200..<300).contains(code) {
+                outcome = data.map(Outcome.success) ?? .fatal("empty response")
+            } else if code == 401 {
+                outcome = .fatal("token stale")
+            } else if code == 429 || (500..<600).contains(code) {
+                let retryAfter = http.value(forHTTPHeaderField: "Retry-After").flatMap(TimeInterval.init)
+                outcome = .retryable("HTTP \(code)", retryAfter: retryAfter)
+            } else {
+                outcome = .fatal("HTTP \(code)")
+            }
         }
         task.resume()
-        if semaphore.wait(timeout: .now() + 20) == .timedOut { task.cancel() }
-        return result
+        if semaphore.wait(timeout: .now() + 20) == .timedOut {
+            task.cancel()
+            return .retryable("network timeout", retryAfter: nil)
+        }
+        return outcome
     }
 
     private func jsonDictionary(at path: String) -> [String: Any]? {
@@ -562,6 +595,12 @@ final class UsageCollector {
 
     private func saveCache(_ profile: UsageProfile) {
         guard !profile.limits.isEmpty else { return }
+        // A degraded 200 can parse to limits whose percents are all nil; caching that would
+        // replay a blank reading over good data until the next success. Keep the old cache.
+        guard profile.limits.contains(where: { $0.percent != nil }) else {
+            Log.fetch.error("refusing to cache an all-nil-percent reading for a Claude profile")
+            return
+        }
         try? fileManager.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
         let cached = CachedLimits(savedAt: Date().timeIntervalSince1970, limits: profile.limits)
         if let data = try? JSONEncoder().encode(cached) {
@@ -574,5 +613,6 @@ final class UsageCollector {
               let cached = try? JSONDecoder().decode(CachedLimits.self, from: data) else { return }
         profile.limits = cached.limits
         profile.observedAt = cached.savedAt
+        profile.isStale = true
     }
 }
